@@ -107,8 +107,11 @@ export function isRateLimited(): boolean {
 }
 
 export async function waitForRateLimit(): Promise<void> {
-  const remaining = rateLimitedUntil - Date.now()
-  if (remaining > 0) await new Promise(r => setTimeout(r, remaining))
+  while (true) {
+    const remaining = rateLimitedUntil - Date.now()
+    if (remaining <= 0) return
+    await new Promise(r => setTimeout(r, remaining))
+  }
 }
 
 export function isRateLimitError(err: any): boolean {
@@ -212,11 +215,12 @@ function wrapSend<T extends { send: (...args: any[]) => any; destroy?: () => any
       }
     }
 
-    // 1. Respect global rate-limit backoff
-    if (isRateLimited()) await waitForRateLimit()
-
-    // 2. Throttle: ensure MIN_CALL_GAP_MS between calls
-    await throttle()
+    // Recheck after reserving a slot: another request may extend the
+    // cooldown while this request is waiting in the throttle queue.
+    do {
+      await waitForRateLimit()
+      await throttle()
+    } while (isRateLimited())
 
     let inFlightPromise: Promise<any> | undefined
     if (method === 'eth_blockNumber') {

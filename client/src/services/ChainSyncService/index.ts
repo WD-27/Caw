@@ -1284,18 +1284,28 @@ function registerTask(task: SyncTask) {
 
 function startTask(task: SyncTask, heartbeat: (loopName?: string) => void) {
   const loopName = `ChainSync:${task.name}`
+  let running = false
+
+  const run = async (initial: boolean) => {
+    if (running) return
+    running = true
+    try {
+      await task.sync()
+      heartbeat(loopName)
+    } catch (err: any) {
+      console.error(`[ChainSync:${task.name}] ${initial ? 'Initial sync' : 'Sync'} failed:`, err.message)
+    } finally {
+      running = false
+    }
+  }
 
   // Run immediately
-  task.sync().then(() => heartbeat(loopName)).catch(err => {
-    console.error(`[ChainSync:${task.name}] Initial sync failed:`, err.message)
-  })
+  void run(true)
 
   // Then run on interval
   task.timerId = setInterval(() => {
     task.lastRun = Date.now()
-    task.sync().then(() => heartbeat(loopName)).catch(err => {
-      console.error(`[ChainSync:${task.name}] Sync failed:`, err.message)
-    })
+    void run(false)
   }, task.interval)
 }
 
