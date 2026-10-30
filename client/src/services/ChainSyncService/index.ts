@@ -41,7 +41,9 @@ const UNISWAP_V2_PAIR_ABI = [
 interface SyncTask {
   name: string
   interval: number // ms
-  sync: () => Promise<void>
+  sync: (signal?: AbortSignal) => Promise<void>
+  controller?: AbortController
+  inFlight?: Promise<void>
   lastRun?: number
   timerId?: NodeJS.Timeout
 }
@@ -93,6 +95,10 @@ let lastProviderConfig: ChainSyncConfig | null = null
 let lastProviderRebuildAt = 0
 
 const syncTasks: Map<string, SyncTask> = new Map()
+// Survives same-process watchdog restarts; never release while a pass can write.
+const activeTaskRuns: Map<string, Promise<void>> = new Map()
+// Bound each HTTP fetch below the shortest watchdog loop (L2Events: 240s).
+const CHAIN_SYNC_HTTP_TIMEOUT_MS = 30_000
 
 // In-memory price caches (also persisted to DB)
 let cawPriceCache: CachedCawPrice | null = null
@@ -132,19 +138,19 @@ async function initializeProviders(config: ChainSyncConfig) {
   if (!l1Provider && config.l1RpcUrl) {
     const l1Url = getL1HttpRpcUrl(config.l1RpcUrl)
     console.log('[ChainSync] L1 provider URL:', redactRpcUrl(l1Url))
-    l1Provider = await makeVerifiedJsonRpcProvider(l1Url, 11155111)
+    l1Provider = await makeVerifiedJsonRpcProvider(l1Url, 11155111, undefined, CHAIN_SYNC_HTTP_TIMEOUT_MS)
     networkManager = new Contract(NETWORK_MANAGER_ADDRESS, cawNetworkManagerAbi, l1Provider)
   }
 
   if (!l2Provider && config.l2RpcUrl) {
     const l2Url = getL2HttpRpcUrl(config.l2RpcUrl)
     console.log('[ChainSync] L2 provider URL:', redactRpcUrl(l2Url))
-    l2Provider = await makeVerifiedJsonRpcProvider(l2Url, 84532)
+    l2Provider = await makeVerifiedJsonRpcProvider(l2Url, 84532, undefined, CHAIN_SYNC_HTTP_TIMEOUT_MS)
   }
 
   if (!mainnetProvider && config.ethMainnetRpcUrl) {
     console.log('[ChainSync] Mainnet provider URL:', redactRpcUrl(config.ethMainnetRpcUrl))
-    mainnetProvider = await makeVerifiedJsonRpcProvider(config.ethMainnetRpcUrl, 1)
+    mainnetProvider = await makeVerifiedJsonRpcProvider(config.ethMainnetRpcUrl, 1, undefined, CHAIN_SYNC_HTTP_TIMEOUT_MS)
     uniswapRouter = new Contract(UNISWAP_V2_ROUTER, UNISWAP_V2_ROUTER_ABI, mainnetProvider)
   }
 
@@ -976,7 +982,8 @@ async function handleAuthenticated(args: any) {
   }
 }
 
-async function syncL2Events(): Promise<void> {
+async function syncL2Events(signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return
   if (!l2Provider) {
     console.log('[ChainSync:L2Events] Skipping — L2 provider not available')
     return
@@ -986,7 +993,9 @@ async function syncL2Events(): Promise<void> {
 
   // Determine starting block
   let fromBlock = await getLastSyncedL2Block()
+  if (signal?.aborted) return
   const latestBlock = await l2Provider.getBlockNumber()
+  if (signal?.aborted) return
 
   if (fromBlock === null) {
     fromBlock = Math.max(0, latestBlock - L2_EVENT_BOOTSTRAP_LOOKBACK)
@@ -999,6 +1008,7 @@ async function syncL2Events(): Promise<void> {
   let cursor = fromBlock + 1
   let totalEvents = 0
   while (cursor <= latestBlock) {
+    if (signal?.aborted) return
     const toBlock = Math.min(cursor + L2_EVENT_CHUNK_SIZE - 1, latestBlock)
 
     try {
@@ -1006,8 +1016,11 @@ async function syncL2Events(): Promise<void> {
       // comment for rationale. Batched member-failures on rate limit are
       // far more painful than a 300ms serial latency hit.
       const created = await contract.queryFilter(contract.filters.SessionCreated(), cursor, toBlock)
+      if (signal?.aborted) return
       const revoked = await contract.queryFilter(contract.filters.SessionRevoked(), cursor, toBlock)
+      if (signal?.aborted) return
       const authed = await contract.queryFilter(contract.filters.Authenticated(), cursor, toBlock)
+      if (signal?.aborted) return
 
       // Process in block/logIndex order to handle a revoke+create in the same block correctly
       const combined = [
@@ -1019,6 +1032,8 @@ async function syncL2Events(): Promise<void> {
         return ((a.ev as any).index ?? (a.ev as any).logIndex ?? 0) - ((b.ev as any).index ?? (b.ev as any).logIndex ?? 0)
       })
 
+      // Once writes begin, finish and checkpoint this chunk before stopping.
+      // stopTask drains us, so a replacement cannot interleave with these writes.
       for (const { ev, kind } of combined) {
         const args = (ev as any).args
         if (!args) continue
@@ -1030,6 +1045,7 @@ async function syncL2Events(): Promise<void> {
       totalEvents += combined.length
       await setLastSyncedL2Block(toBlock)
     } catch (err: any) {
+      if (signal?.aborted) return
       console.error(`[ChainSync:L2Events] getLogs failed for range ${cursor}-${toBlock}:`, err.message?.slice(0, 200))
       maybeRebuildProviders(err)
       // Break out — next tick will retry from the current cursor
@@ -1284,19 +1300,26 @@ function registerTask(task: SyncTask) {
 
 function startTask(task: SyncTask, heartbeat: (loopName?: string) => void) {
   const loopName = `ChainSync:${task.name}`
-  let running = false
+  const controller = new AbortController()
+  task.controller = controller
 
   const run = async (initial: boolean) => {
-    if (running) return
-    running = true
-    try {
-      await task.sync()
-      heartbeat(loopName)
-    } catch (err: any) {
-      console.error(`[ChainSync:${task.name}] ${initial ? 'Initial sync' : 'Sync'} failed:`, err.message)
-    } finally {
-      running = false
-    }
+    if (controller.signal.aborted || activeTaskRuns.has(task.name)) return
+    // Defer execution until the lock is installed, even if sync throws synchronously.
+    const pending = Promise.resolve().then(() => {
+      if (!controller.signal.aborted) return task.sync(controller.signal)
+    }).then(() => {
+      if (!controller.signal.aborted) heartbeat(loopName)
+    }).catch((err: any) => {
+      if (!controller.signal.aborted) {
+        console.error(`[ChainSync:${task.name}] ${initial ? 'Initial sync' : 'Sync'} failed:`, err.message)
+      }
+    }).finally(() => {
+      if (activeTaskRuns.get(task.name) === pending) activeTaskRuns.delete(task.name)
+    })
+    task.inFlight = pending
+    activeTaskRuns.set(task.name, pending)
+    await pending
   }
 
   // Run immediately
@@ -1309,11 +1332,14 @@ function startTask(task: SyncTask, heartbeat: (loopName?: string) => void) {
   }, task.interval)
 }
 
-function stopTask(task: SyncTask) {
+async function stopTask(task: SyncTask): Promise<void> {
+  task.controller?.abort()
   if (task.timerId) {
     clearInterval(task.timerId)
     task.timerId = undefined
   }
+  // Do not detach a sync Promise: it may already be inside a database write.
+  await task.inFlight
 }
 
 // ============================================================================
@@ -1427,8 +1453,9 @@ export const chainSyncService = {
 
       async stop() {
         console.log('[ChainSync] Stopping service...')
-        syncTasks.forEach(task => stopTask(task))
+        const draining = Array.from(syncTasks.values(), task => stopTask(task))
         syncTasks.clear()
+        await Promise.all(draining)
         await prisma.$disconnect()
       },
 

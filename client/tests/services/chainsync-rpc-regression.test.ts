@@ -7,6 +7,7 @@ import path from 'node:path';
 import vm from 'node:vm';
 import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
+import { FetchRequest, JsonRpcProvider, Network } from 'ethers';
 
 const testDirectory = path.dirname(fileURLToPath(import.meta.url));
 
@@ -23,7 +24,7 @@ class Clock {
     return id;
   }
   async flush() {
-    for (let i = 0; i < 20; i++) await Promise.resolve();
+    for (let i = 0; i < 100; i++) await Promise.resolve();
   }
   async advance(ms: number) {
     const target = this.now + ms;
@@ -44,7 +45,8 @@ class Clock {
   }
 }
 
-function loadSelected(relativePath: string, names: string[], expose: string[], clock: Clock): any {
+function loadSelected(relativePath: string, names: string[], expose: string[], clock: Clock,
+  globals: Record<string, unknown> = {}, optionalNames: string[] = []): any {
   const filename = path.resolve(testDirectory, '../..', relativePath);
   const source = fs.readFileSync(filename, 'utf8');
   const ast = ts.createSourceFile(filename, source, ts.ScriptTarget.Latest, true);
@@ -54,7 +56,7 @@ function loadSelected(relativePath: string, names: string[], expose: string[], c
     const declared = ts.isFunctionDeclaration(node) ? [node.name?.text]
       : ts.isVariableStatement(node)
         ? node.declarationList.declarations.map(d => d.name.getText(ast)) : [];
-    if (declared.some(name => typeof name === 'string' && names.includes(name))) {
+    if (declared.some(name => typeof name === 'string' && [...names, ...optionalNames].includes(name))) {
       for (const name of declared) if (typeof name === 'string' && names.includes(name)) found.add(name);
       selected.push(node.getText(ast));
     }
@@ -66,10 +68,15 @@ function loadSelected(relativePath: string, names: string[], expose: string[], c
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
   }).outputText;
   const context = vm.createContext({
-    Date: { now: () => clock.now },
+    Date: class extends Date {
+      constructor(value?: number | string) { super(value ?? clock.now); }
+      static now() { return clock.now; }
+    },
+    AbortController, activeTaskRuns: new Map(),
     setTimeout: clock.setTimeout, setInterval: clock.setInterval,
     clearTimeout: clock.clear, clearInterval: clock.clear,
     console: { log() {}, warn() {}, error() {} },
+    ...globals,
   }, { codeGeneration: { strings: false, wasm: false } });
   vm.runInContext(js, context, { timeout: 1000 });
   return context.subject;
@@ -186,4 +193,346 @@ test('a rate limit set while queued in the throttle is respected before send', a
   await clock.advance(4850);
   await Promise.all([first, second]);
   assert.deepEqual(sent, [0, 5000]);
+});
+
+
+function httpFactory(clock: Clock) {
+  return loadSelected('src/utils/rpcProvider.ts', [
+    'makeJsonRpcProvider', 'buildAuthenticatedFetchRequest', 'extractEmbeddedAuth', 'basicAuthHeader',
+  ], ['makeJsonRpcProvider'], clock, {
+    FetchRequest, JsonRpcProvider, Network, URL, Buffer,
+    wrapSend: (provider: unknown) => provider,
+  }, ['withHttpRequestTimeout']);
+}
+
+test('HTTP deadline: the actual ethers request clone has a bounded timeout and is cancelled', async () => {
+  const clock = new Clock();
+  const subject = httpFactory(clock);
+  const provider = subject.makeJsonRpcProvider('https://rpc.invalid', 84532, undefined, 30000);
+  try {
+    const request = provider._getConnection();
+    let signal: { cancelled: boolean } | undefined;
+    let release!: (value: unknown) => void;
+    request.getUrlFunc = (_request: unknown, cancelSignal: { cancelled: boolean }) => {
+      signal = cancelSignal;
+      return new Promise(resolve => { release = resolve; });
+    };
+    const outcome = request.send().then(() => 'response', (err: any) => err.code);
+    await clock.advance(30000);
+    assert.equal(request.timeout, 30000);
+    assert.equal(await outcome, 'TIMEOUT');
+    assert.equal(signal?.cancelled, true, 'the real FetchCancelSignal must be cancelled');
+    release({ statusCode: 200, statusMessage: 'OK', headers: {}, body: new Uint8Array() });
+    await clock.flush();
+    assert.equal(await outcome, 'TIMEOUT', 'a late transport response cannot become success');
+    assert.equal(clock.timers.size, 0, 'deadline timer must be cleaned up');
+  } finally { provider.destroy(); }
+});
+
+test('HTTP deadline: fast requests clear their timer and other providers retain the default', async () => {
+  const clock = new Clock();
+  const subject = httpFactory(clock);
+  const bounded = subject.makeJsonRpcProvider('https://rpc.invalid', 84532, undefined, 30000);
+  const unchanged = subject.makeJsonRpcProvider('https://rpc.invalid', 84532);
+  try {
+    const request = bounded._getConnection();
+    request.getUrlFunc = async () => ({ statusCode: 200, statusMessage: 'OK', headers: {}, body: new Uint8Array() });
+    assert.equal((await request.send()).statusCode, 200);
+    assert.equal(request.timeout, 30000);
+    assert.equal(unchanged._getConnection().timeout, 300000);
+    assert.equal(clock.timers.size, 0);
+  } finally { bounded.destroy(); unchanged.destroy(); }
+});
+
+test('restart guard: a replacement with the same task name cannot overlap a stopped pass', async () => {
+  const clock = new Clock();
+  const subject = scheduler(clock);
+  let release!: () => void;
+  let calls = 0;
+  const old = { name: 'L2Events', interval: 60000, sync: async () => {
+    calls++;
+    await new Promise<void>(resolve => { release = resolve; });
+  } };
+  subject.startTask(old, () => {});
+  await clock.flush();
+  const stopped = subject.stopTask(old);
+  const replacement = { name: 'L2Events', interval: 60000, sync: async () => { calls++; } };
+  subject.startTask(replacement, () => {});
+  await clock.flush();
+  const beforeRelease = calls;
+  release();
+  await stopped;
+  await clock.advance(60000);
+  await subject.stopTask(replacement);
+  assert.equal(beforeRelease, 1, 'a task name stays locked until the old pass really exits');
+  assert.equal(calls, 2, 'the replacement can run once the old pass has exited');
+});
+
+test('restart guard: independent task names can progress while one name is held', async () => {
+  const clock = new Clock();
+  const subject = scheduler(clock);
+  let release!: () => void;
+  let clients = 0;
+  const held = { name: 'L2Events', interval: 60000, sync: () => new Promise<void>(r => { release = r; }) };
+  const other = { name: 'Clients', interval: 60000, sync: async () => { clients++; } };
+  subject.startTask(held, () => {});
+  subject.startTask(other, () => {});
+  await clock.advance(60000);
+  assert.equal(clients, 2);
+  release();
+  await subject.stopTask(held);
+  await subject.stopTask(other);
+});
+
+// Execute the real L2 loop, cursor/session handlers and runServices watchdog.
+// The only provider and Prisma objects are in-memory mocks; no app imports.
+function lifecycle(clock: Clock, boundedHttp = false, pauseWrite = false) {
+  let cursor = 100;
+  const writes: number[] = [];
+  const sessions = new Map<string, any>();
+  const starts: number[] = [];
+  const stops: number[] = [];
+  const beats: number[] = [];
+  let hold = !pauseWrite;
+  let releaseWrite!: () => void;
+  let injectedSpend = false;
+  const args = (key: string) => ({ owner: 'owner', sessionKey: key, expiry: 1000,
+    scopeBitmap: 255, spendLimit: '100', perActionTipRate: '0' });
+  const events: Record<string, any[]> = {
+    created: [
+      { blockNumber: 110, index: 0, args: args('b') },
+      { blockNumber: 115, index: 0, args: args('a') },
+    ],
+    revoked: [{ blockNumber: 200, index: 0, args: args('b') }],
+    authed: [],
+  };
+  const prisma = {
+    chainData: {
+      findUnique: async () => ({ value: { block: cursor } }),
+      upsert: async ({ update }: any) => {
+        cursor = update.value.block;
+        writes.push(cursor);
+        // A separate API write after indexing; a replay must not zero it.
+        if (cursor === 400 && !injectedSpend) {
+          sessions.get('owner:a').spent = '7';
+          injectedSpend = true;
+        }
+      },
+    },
+    sessionKey: {
+      upsert: async ({ where, update, create }: any) => {
+        const id = where.ownerAddress_sessionAddress;
+        const key = `${id.ownerAddress}:${id.sessionAddress}`;
+        if (pauseWrite && key === 'owner:b') {
+          await new Promise<void>(resolve => { releaseWrite = resolve; });
+        }
+        sessions.set(key, sessions.has(key) ? { ...sessions.get(key), ...update }
+          : { revokedAt: null, spent: '0', ...create });
+      },
+      updateMany: async ({ where, data }: any) => {
+        const key = `${where.ownerAddress}:${where.sessionAddress}`;
+        const row = sessions.get(key);
+        if (row && row.revokedAt === null) Object.assign(row, data);
+        return { count: row ? 1 : 0 };
+      },
+    },
+    user: { findFirst: async () => null },
+    networkAuth: { upsert: async () => {} },
+    network: { count: async () => 0 },
+    $disconnect: async () => {},
+  };
+  const http = boundedHttp ? httpFactory(clock).makeJsonRpcProvider('https://rpc.invalid', 84532, undefined, 30000) : null;
+  const provider = { getBlockNumber: async () => clock.now < 120000 ? 100 : clock.now < 160000 ? 125 : 400 };
+  class MockContract {
+    filters = { SessionCreated: () => 'created', SessionRevoked: () => 'revoked', Authenticated: () => 'authed' };
+    async queryFilter(kind: string, from: number, to: number) {
+      if (hold) {
+        hold = false;
+        if (http) {
+          const request = http._getConnection();
+          request.getUrlFunc = async () => new Promise(resolve => clock.setTimeout(() => {
+            resolve({ statusCode: 200, statusMessage: 'OK', headers: {}, body: new Uint8Array() });
+          }, 280000));
+          await request.send();
+        } else {
+          // Deliberately ignores cooperative cancellation to test draining.
+          await new Promise<void>(resolve => clock.setTimeout(resolve, 280000));
+        }
+      }
+      return events[kind].filter(e => e.blockNumber >= from && e.blockNumber <= to);
+    }
+  }
+  const subject = loadSelected('src/services/ChainSyncService/index.ts', [
+    'startTask', 'stopTask', 'registerTask', 'chainSyncService', 'getLastSyncedL2Block', 'setLastSyncedL2Block',
+    'handleSessionCreated', 'handleSessionRevoked', 'handleAuthenticated', 'syncL2Events',
+  ], ['chainSyncService'], clock, {
+    prisma, l2Provider: provider, Contract: MockContract,
+    CAW_NAMES_L2_ADDRESS: 'ledger', CAW_NAME_L2_EVENT_ABI: [],
+    L2_SYNC_BLOCK_KEY: 'cursor', L2_EVENT_BOOTSTRAP_LOOKBACK: 10000, L2_EVENT_CHUNK_SIZE: 2000,
+    maybeRebuildProviders: () => {}, syncTasks: new Map(),
+    initializeProviders: async () => {}, loadPricesFromDb: async () => {}, syncAllNetworks: async () => {},
+    getL1HttpRpcUrl: () => '', getL2HttpRpcUrl: () => '', getEthMainnetHttpRpcUrl: () => '',
+    redactRpcUrl: () => '<mock>', cawPriceCache: null, ethPriceCache: null,
+  });
+  const watchdog = loadSelected('src/runServices.ts', ['runInstance'], ['runInstance'], clock, {
+    DEFAULT_HEARTBEAT_TIMEOUT_MS: 300000, DEGRADED_ESCALATE_FACTOR: 10,
+    HEARTBEAT_CHECK_INTERVAL_MS: 30000, RESTART_ALERT_THRESHOLD: 3, RESTART_ALERT_WINDOW_MS: 600000,
+    delay: (ms: number) => new Promise<void>(resolve => clock.setTimeout(resolve, ms)),
+  });
+  const instance = watchdog.runInstance({ instance: 'mock-chain-sync', config: {}, service: {
+    start(_config: unknown, ctx: any) {
+      starts.push(clock.now);
+      const actual = subject.chainSyncService.start({ l1RpcUrl: '', l2RpcUrl: 'mock' }, {
+        ...ctx,
+        heartbeat(name: string) {
+          if (name === 'ChainSync:L2Events') beats.push(clock.now);
+          ctx.heartbeat(name);
+        },
+      });
+      return { ...actual, stop: async () => {
+        stops.push(clock.now);
+        await actual.stop();
+      } };
+    },
+  } });
+  return { sessions, writes, starts, stops, beats, cursor: () => cursor, releaseWrite: () => releaseWrite(),
+    stop: async () => { await instance.stop(); http?.destroy(); } };
+}
+
+test('watchdog regression: held 280s, restart requested at 330s, late response cannot roll back state', async () => {
+  const clock = new Clock();
+  const state = lifecycle(clock);
+  await clock.advance(410000);
+  await state.stop();
+  assert.deepEqual(state.stops.slice(0, 1), [330000], 'run the real 240s watchdog boundary');
+  assert.ok(state.writes.every((block, i, all) => i === 0 || block >= all[i - 1]),
+    `cursor regressed: ${state.writes}`);
+  assert.equal(state.cursor(), 400);
+  assert.ok(state.sessions.get('owner:b')?.revokedAt, 'a stale SessionCreated must not undo revocation');
+  assert.equal(state.sessions.get('owner:a')?.spent, '7', 'a late pass must not reset spent');
+  assert.deepEqual(state.starts, [0, 405000], 'restart must wait for the old pass to exit at 400s');
+  assert.ok(!state.beats.includes(400000), 'stopped passes must not report successful progress');
+});
+
+test('watchdog latency: bounded HTTP fetch recovers sessions before watchdog expiry and ignores late transport', async () => {
+  const clock = new Clock();
+  const state = lifecycle(clock, true);
+  await clock.advance(180000);
+  const indexedAt180s = state.cursor();
+  await clock.advance(230000);
+  await state.stop();
+  assert.equal(indexedAt180s, 400, 'sessions must recover on the next tick after the 30s fetch deadline');
+  assert.deepEqual(state.starts, [0], 'one hung HTTP request must not require a watchdog restart');
+  assert.equal(state.cursor(), 400);
+  assert.ok(state.sessions.get('owner:b')?.revokedAt);
+  assert.equal(state.sessions.get('owner:a')?.spent, '7');
+  assert.ok(state.writes.every((block, i, all) => i === 0 || block >= all[i - 1]));
+});
+
+
+test('stop boundary: an in-flight database chunk is drained and checkpointed before replacement', async () => {
+  const clock = new Clock();
+  const state = lifecycle(clock, false, true);
+  await clock.advance(120000);
+  let stopped = false;
+  const stopping = state.stop().then(() => { stopped = true; });
+  await clock.flush();
+  assert.equal(stopped, false, 'stop must wait for the in-flight write');
+  state.releaseWrite();
+  await stopping;
+  assert.equal(state.cursor(), 125, 'a started chunk must commit its cursor before shutdown');
+  assert.ok(state.sessions.has('owner:a'), 'finish the chunk rather than leave a partial replay');
+});
+
+test('stop boundary: stopping before the deferred initial call prevents sync from starting', async () => {
+  const clock = new Clock();
+  const subject = scheduler(clock);
+  let calls = 0;
+  const task = { name: 'L2Events', interval: 60000, sync: async () => { calls++; } };
+  subject.startTask(task, () => {});
+  await subject.stopTask(task);
+  await clock.advance(120000);
+  assert.equal(calls, 0);
+});
+
+test('HTTP deadline: real JsonRpcProvider._send uses the bounded clone without network access', async () => {
+  const clock = new Clock();
+  const subject = httpFactory(clock);
+  const provider = subject.makeJsonRpcProvider('https://rpc.invalid', 84532, undefined, 30000);
+  const connection = provider._getConnection.bind(provider);
+  let observedTimeout = 0;
+  provider._getConnection = () => {
+    const request = connection();
+    request.getUrlFunc = async (req: FetchRequest) => {
+      observedTimeout = req.timeout;
+      return { statusCode: 200, statusMessage: 'OK', headers: {},
+        body: new TextEncoder().encode(JSON.stringify({ jsonrpc: '2.0', id: 1, result: [] })) };
+    };
+    return request;
+  };
+  try {
+    const result = await provider._send({ jsonrpc: '2.0', id: 1, method: 'eth_getLogs', params: [] });
+    assert.equal(result[0].id, 1);
+    assert.equal(observedTimeout, 30000);
+    assert.equal(clock.timers.size, 0);
+  } finally { provider.destroy(); }
+});
+
+test('HTTP429: queued sends respect both the 5s cooldown and its extension to 15s', async () => {
+  const clock = new Clock();
+  const subject = rpc(clock);
+  const sent: number[] = [];
+  const provider = subject.wrapSend({ send: async () => {
+    sent.push(clock.now);
+    if (sent.length <= 2) throw new Error('HTTP status 429');
+    return 'ok';
+  } });
+  const pending = Array.from({ length: 10 }, () => provider.send('eth_getLogs', []).catch(() => '429'));
+  await clock.advance(4999);
+  assert.deepEqual(sent, [0]);
+  await clock.advance(1);
+  assert.deepEqual(sent, [0, 5000]);
+  await clock.advance(9999);
+  assert.deepEqual(sent, [0, 5000]);
+  await clock.advance(2000);
+  await Promise.all(pending);
+  assert.equal(sent.length, 10);
+  assert.ok(sent.slice(2).every(t => t >= 15000));
+  assert.ok(sent.every((t, i) => i === 0 || t - sent[i - 1] >= 150));
+});
+
+test('HTTP429 transport: real ethers surfaces 429 and the next send waits for the shared cooldown', async () => {
+  const clock = new Clock();
+  const limiter = rpc(clock);
+  const provider = httpFactory(clock).makeJsonRpcProvider('https://rpc.invalid', 84532, undefined, 30000);
+  const connection = provider._getConnection.bind(provider);
+  let transportCalls = 0;
+  provider._getConnection = () => {
+    const request = connection();
+    request.getUrlFunc = async (req: FetchRequest) => {
+      if (++transportCalls === 1) {
+        return { statusCode: 429, statusMessage: 'Too Many Requests', headers: {}, body: new Uint8Array() };
+      }
+      const payload = JSON.parse(new TextDecoder().decode(req.body ?? new Uint8Array()));
+      const result = (Array.isArray(payload) ? payload : [payload]).map((item: any) => {
+        assert.equal(item.method, 'eth_getLogs');
+        return { jsonrpc: '2.0', id: item.id, result: [] };
+      });
+      return { statusCode: 200, statusMessage: 'OK', headers: {},
+        body: new TextEncoder().encode(JSON.stringify(result)) };
+    };
+    return request;
+  };
+  try {
+    const wrapped = limiter.wrapSend(provider);
+    await assert.rejects(wrapped.send('eth_getLogs', []));
+    assert.equal(transportCalls, 1, 'do not let ethers immediately resend below wrapSend');
+    assert.equal(limiter.isRateLimited(), true);
+    const next = wrapped.send('eth_getLogs', []);
+    await clock.advance(4999);
+    assert.equal(transportCalls, 1);
+    await clock.advance(1);
+    assert.deepEqual(await next, []);
+    assert.equal(transportCalls, 2);
+  } finally { provider.destroy(); }
 });
