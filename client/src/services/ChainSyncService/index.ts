@@ -99,6 +99,9 @@ const syncTasks: Map<string, SyncTask> = new Map()
 const activeTaskRuns: Map<string, Promise<void>> = new Map()
 // Bound each HTTP fetch below the shortest watchdog loop (L2Events: 240s).
 const CHAIN_SYNC_HTTP_TIMEOUT_MS = 30_000
+// Bound watchdog shutdown, not the lifetime of a pass that may still write.
+// Its task-name guard remains held until the original Promise settles.
+const CHAIN_SYNC_STOP_DRAIN_MS = 60_000
 
 // In-memory price caches (also persisted to DB)
 let cawPriceCache: CachedCawPrice | null = null
@@ -813,13 +816,15 @@ const L2_EVENT_CHUNK_SIZE = 2000 // blocks per getLogs call
 const L2_EVENT_BOOTSTRAP_LOOKBACK = 10000 // if no cursor exists, start this many blocks back
 
 async function getLastSyncedL2Block(): Promise<number | null> {
-  try {
-    const row = await prisma.chainData.findUnique({ where: { key: L2_SYNC_BLOCK_KEY } })
-    const value = row?.value as any
-    return typeof value?.block === 'number' ? value.block : null
-  } catch {
-    return null
+  const row = await prisma.chainData.findUnique({ where: { key: L2_SYNC_BLOCK_KEY } })
+  // Only a missing row may bootstrap. Read errors and malformed state must
+  // abort the pass before RPC/event writes can rewind a persisted cursor.
+  if (!row) return null
+  const block = (row.value as any)?.block
+  if (typeof block !== 'number' || !Number.isSafeInteger(block) || block < 0) {
+    throw new Error('Invalid persisted L2 cursor')
   }
+  return block
 }
 
 async function setLastSyncedL2Block(block: number): Promise<void> {
@@ -1033,7 +1038,7 @@ async function syncL2Events(signal?: AbortSignal): Promise<void> {
       })
 
       // Once writes begin, finish and checkpoint this chunk before stopping.
-      // stopTask drains us, so a replacement cannot interleave with these writes.
+      // activeTaskRuns retains our guard even if stop() reaches its drain limit.
       for (const { ev, kind } of combined) {
         const args = (ev as any).args
         if (!args) continue
@@ -1085,13 +1090,14 @@ const L1_FEE_EVENT_CHUNK_SIZE = 2000   // blocks per getLogs call (stays under f
 const L1_FEE_EVENT_BOOTSTRAP_LOOKBACK = 50000 // if no cursor, start this many L1 blocks back
 
 async function getLastSyncedL1FeeBlock(): Promise<number | null> {
-  try {
-    const row = await prisma.chainData.findUnique({ where: { key: L1_FEE_SYNC_BLOCK_KEY } })
-    const value = row?.value as any
-    return typeof value?.block === 'number' ? value.block : null
-  } catch {
-    return null
+  const row = await prisma.chainData.findUnique({ where: { key: L1_FEE_SYNC_BLOCK_KEY } })
+  // An unavailable cursor is not evidence that this stream has never synced.
+  if (!row) return null
+  const block = (row.value as any)?.block
+  if (typeof block !== 'number' || !Number.isSafeInteger(block) || block < 0) {
+    throw new Error('Invalid persisted L1 fee cursor')
   }
+  return block
 }
 
 async function setLastSyncedL1FeeBlock(block: number): Promise<void> {
@@ -1338,7 +1344,7 @@ async function stopTask(task: SyncTask): Promise<void> {
     clearInterval(task.timerId)
     task.timerId = undefined
   }
-  // Do not detach a sync Promise: it may already be inside a database write.
+  // Keep the pass guarded until it settles, even if service stop() times out.
   await task.inFlight
 }
 
@@ -1455,8 +1461,22 @@ export const chainSyncService = {
         console.log('[ChainSync] Stopping service...')
         const draining = Array.from(syncTasks.values(), task => stopTask(task))
         syncTasks.clear()
-        await Promise.all(draining)
-        await prisma.$disconnect()
+        let timer: ReturnType<typeof setTimeout> | undefined
+        try {
+          const drained = await Promise.race([
+            Promise.all(draining).then(() => true),
+            new Promise<boolean>(resolve => {
+              timer = setTimeout(() => resolve(false), CHAIN_SYNC_STOP_DRAIN_MS)
+            }),
+          ])
+          if (!drained) {
+            console.warn('[ChainSync] Stop drain timed out; active passes retain their task-name guards')
+          }
+        } finally {
+          clearTimeout(timer)
+        }
+        // Prisma is process-owned and shared with other services and old passes.
+        // Only shutdownPrisma() at process exit owns connection teardown.
       },
 
       stats: async () => {

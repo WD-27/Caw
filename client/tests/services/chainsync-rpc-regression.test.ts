@@ -296,6 +296,7 @@ function lifecycle(clock: Clock, boundedHttp = false, pauseWrite = false) {
   let hold = !pauseWrite;
   let releaseWrite!: () => void;
   let injectedSpend = false;
+  let disconnectCalls = 0;
   const args = (key: string) => ({ owner: 'owner', sessionKey: key, expiry: 1000,
     scopeBitmap: 255, spendLimit: '100', perActionTipRate: '0' });
   const events: Record<string, any[]> = {
@@ -339,7 +340,7 @@ function lifecycle(clock: Clock, boundedHttp = false, pauseWrite = false) {
     user: { findFirst: async () => null },
     networkAuth: { upsert: async () => {} },
     network: { count: async () => 0 },
-    $disconnect: async () => {},
+    $disconnect: async () => { disconnectCalls++; },
   };
   const http = boundedHttp ? httpFactory(clock).makeJsonRpcProvider('https://rpc.invalid', 84532, undefined, 30000) : null;
   const provider = { getBlockNumber: async () => clock.now < 120000 ? 100 : clock.now < 160000 ? 125 : 400 };
@@ -365,7 +366,7 @@ function lifecycle(clock: Clock, boundedHttp = false, pauseWrite = false) {
   const subject = loadSelected('src/services/ChainSyncService/index.ts', [
     'startTask', 'stopTask', 'registerTask', 'chainSyncService', 'getLastSyncedL2Block', 'setLastSyncedL2Block',
     'handleSessionCreated', 'handleSessionRevoked', 'handleAuthenticated', 'syncL2Events',
-  ], ['chainSyncService'], clock, {
+  ], ['chainSyncService', 'activeTaskRuns'], clock, {
     prisma, l2Provider: provider, Contract: MockContract,
     CAW_NAMES_L2_ADDRESS: 'ledger', CAW_NAME_L2_EVENT_ABI: [],
     L2_SYNC_BLOCK_KEY: 'cursor', L2_EVENT_BOOTSTRAP_LOOKBACK: 10000, L2_EVENT_CHUNK_SIZE: 2000,
@@ -373,7 +374,7 @@ function lifecycle(clock: Clock, boundedHttp = false, pauseWrite = false) {
     initializeProviders: async () => {}, loadPricesFromDb: async () => {}, syncAllNetworks: async () => {},
     getL1HttpRpcUrl: () => '', getL2HttpRpcUrl: () => '', getEthMainnetHttpRpcUrl: () => '',
     redactRpcUrl: () => '<mock>', cawPriceCache: null, ethPriceCache: null,
-  });
+  }, ['CHAIN_SYNC_STOP_DRAIN_MS']);
   const watchdog = loadSelected('src/runServices.ts', ['runInstance'], ['runInstance'], clock, {
     DEFAULT_HEARTBEAT_TIMEOUT_MS: 300000, DEGRADED_ESCALATE_FACTOR: 10,
     HEARTBEAT_CHECK_INTERVAL_MS: 30000, RESTART_ALERT_THRESHOLD: 3, RESTART_ALERT_WINDOW_MS: 600000,
@@ -396,13 +397,14 @@ function lifecycle(clock: Clock, boundedHttp = false, pauseWrite = false) {
     },
   } });
   return { sessions, writes, starts, stops, beats, cursor: () => cursor, releaseWrite: () => releaseWrite(),
+    activeRuns: () => subject.activeTaskRuns.size, disconnectCalls: () => disconnectCalls,
     stop: async () => { await instance.stop(); http?.destroy(); } };
 }
 
 test('watchdog regression: held 280s, restart requested at 330s, late response cannot roll back state', async () => {
   const clock = new Clock();
   const state = lifecycle(clock);
-  await clock.advance(410000);
+  await clock.advance(470000);
   await state.stop();
   assert.deepEqual(state.stops.slice(0, 1), [330000], 'run the real 240s watchdog boundary');
   assert.ok(state.writes.every((block, i, all) => i === 0 || block >= all[i - 1]),
@@ -410,7 +412,7 @@ test('watchdog regression: held 280s, restart requested at 330s, late response c
   assert.equal(state.cursor(), 400);
   assert.ok(state.sessions.get('owner:b')?.revokedAt, 'a stale SessionCreated must not undo revocation');
   assert.equal(state.sessions.get('owner:a')?.spent, '7', 'a late pass must not reset spent');
-  assert.deepEqual(state.starts, [0, 405000], 'restart must wait for the old pass to exit at 400s');
+  assert.deepEqual(state.starts, [0, 395000], 'restart after the 60s drain cap and 5s restart delay');
   assert.ok(!state.beats.includes(400000), 'stopped passes must not report successful progress');
 });
 
@@ -442,6 +444,8 @@ test('stop boundary: an in-flight database chunk is drained and checkpointed bef
   await stopping;
   assert.equal(state.cursor(), 125, 'a started chunk must commit its cursor before shutdown');
   assert.ok(state.sessions.has('owner:a'), 'finish the chunk rather than leave a partial replay');
+  assert.equal(state.activeRuns(), 0);
+  assert.equal(state.disconnectCalls(), 0, 'normal service shutdown must also preserve shared Prisma');
 });
 
 test('stop boundary: stopping before the deferred initial call prevents sync from starting', async () => {
@@ -534,5 +538,131 @@ test('HTTP429 transport: real ethers surfaces 429 and the next send waits for th
     await clock.advance(1);
     assert.deepEqual(await next, []);
     assert.equal(transportCalls, 2);
+  } finally { provider.destroy(); }
+});
+
+
+test('stop boundary: held writes retain their guard and Prisma across watchdog generations', async () => {
+  const clock = new Clock();
+  const state = lifecycle(clock, false, true);
+  await clock.advance(900000);
+  assert.deepEqual(state.starts, [0, 395000, 670000]);
+  assert.equal(state.cursor(), 100);
+  assert.deepEqual(state.writes, [], 'replacement generations must not write while the old pass is held');
+  assert.equal(state.activeRuns(), 1, 'the old pass must retain the shared task-name guard');
+  assert.equal(state.disconnectCalls(), 0, 'service stops must never disconnect shared Prisma');
+  state.releaseWrite();
+  await clock.advance(120000);
+  assert.equal(state.cursor(), 400);
+  assert.equal(state.activeRuns(), 0, 'release the guard only after the old pass and replacement settle');
+  assert.ok(state.writes.every((block, i, all) => i === 0 || block >= all[i - 1]));
+  assert.ok(state.sessions.get('owner:b')?.revokedAt);
+  assert.equal(state.sessions.get('owner:a')?.spent, '7');
+  await state.stop();
+  assert.equal(state.disconnectCalls(), 0);
+});
+
+function cursorScanner(clock: Clock, layer: 'L1' | 'L2', read: () => Promise<unknown>) {
+  const writes: number[] = [];
+  const ranges: [number, number][] = [];
+  let providerReads = 0;
+  const stored = layer === 'L2' ? 10000 : 100000;
+  const provider = { getBlockNumber: async () => { providerReads++; return stored + 10; } };
+  class EmptyContract {
+    filters = new Proxy({}, { get: (_target, key) => () => String(key) });
+    async queryFilter(_kind: string, from: number, to: number) {
+      ranges.push([from, to]);
+      return [];
+    }
+  }
+  const getter = layer === 'L2' ? 'getLastSyncedL2Block' : 'getLastSyncedL1FeeBlock';
+  const setter = layer === 'L2' ? 'setLastSyncedL2Block' : 'setLastSyncedL1FeeBlock';
+  const sync = layer === 'L2' ? 'syncL2Events' : 'syncL1FeeEvents';
+  const subject = loadSelected('src/services/ChainSyncService/index.ts',
+    [getter, setter, sync], [getter, sync], clock, {
+      prisma: { chainData: {
+        findUnique: read,
+        upsert: async ({ update }: any) => { writes.push(update.value.block); },
+      } },
+      l1Provider: provider, l2Provider: provider, Contract: EmptyContract,
+      NETWORK_MANAGER_ADDRESS: 'manager', NETWORK_FEE_EVENT_ABI: [],
+      CAW_NAMES_L2_ADDRESS: 'ledger', CAW_NAME_L2_EVENT_ABI: [],
+      L1_FEE_SYNC_BLOCK_KEY: 'l1-cursor', L1_FEE_EVENT_BOOTSTRAP_LOOKBACK: 50000,
+      L1_FEE_EVENT_CHUNK_SIZE: 2000,
+      L2_SYNC_BLOCK_KEY: 'l2-cursor', L2_EVENT_BOOTSTRAP_LOOKBACK: 10000,
+      L2_EVENT_CHUNK_SIZE: 2000, maybeRebuildProviders: () => {},
+    });
+  return { stored, writes, ranges, providerReads: () => providerReads,
+    read: () => subject[getter](), sync: () => subject[sync]() };
+}
+
+for (const layer of ['L1', 'L2'] as const) {
+  test(`cursor safety ${layer}: failed read cannot bootstrap or write; recovery resumes the stored position`, async () => {
+    const clock = new Clock();
+    let fail = true;
+    const stored = layer === 'L2' ? 10000 : 100000;
+    const state = cursorScanner(clock, layer, async () => {
+      if (fail) throw new Error('mock cursor read failure');
+      return { value: { block: stored } };
+    });
+    await assert.rejects(state.sync(), /mock cursor read failure/);
+    assert.equal(state.providerReads(), 0, 'fail before any RPC');
+    assert.equal(state.ranges.length, 0);
+    assert.deepEqual(state.writes, []);
+    fail = false;
+    await state.sync();
+    assert.deepEqual(state.writes, [stored + 10]);
+    assert.ok(state.ranges.every(([from]) => from === stored + 1));
+  });
+
+  test(`cursor safety ${layer}: malformed persisted positions fail closed`, async () => {
+    const clock = new Clock();
+    for (const value of [null, {}, { block: '10000' }, { block: -1 },
+      { block: 1.5 }, { block: Number.MAX_SAFE_INTEGER + 1 }]) {
+      const state = cursorScanner(clock, layer, async () => ({ value }));
+      await assert.rejects(state.sync(), /Invalid persisted .* cursor/);
+      assert.equal(state.providerReads(), 0);
+      assert.deepEqual(state.writes, []);
+    }
+  });
+}
+
+test('cursor controls: only an absent row bootstraps; zero and valid positions remain valid', async () => {
+  const clock = new Clock();
+  for (const layer of ['L1', 'L2'] as const) {
+    const absent = cursorScanner(clock, layer, async () => null);
+    assert.equal(await absent.read(), null);
+    await absent.sync();
+    const lookback = layer === 'L2' ? 10000 : 50000;
+    assert.equal(absent.ranges[0][0], absent.stored + 10 - lookback + 1);
+    assert.equal(absent.writes.at(-1), absent.stored + 10);
+    for (const block of [0, 10000]) {
+      const present = cursorScanner(clock, layer, async () => ({ value: { block } }));
+      assert.equal(await present.read(), block);
+    }
+  }
+});
+
+test('HTTP deadline boundary: the five-minute circuit wait precedes the HTTP timer', async () => {
+  const clock = new Clock();
+  const limiter = rpc(clock);
+  const provider = httpFactory(clock).makeJsonRpcProvider('https://rpc.invalid', 84532, undefined, 30000);
+  const sent: number[] = [];
+  for (let i = 0; i < 7; i++) limiter.recordRateLimit();
+  const wrapped = limiter.wrapSend({ send: async () => {
+    sent.push(clock.now);
+    const request = provider._getConnection();
+    request.getUrlFunc = async () => ({
+      statusCode: 200, statusMessage: 'OK', headers: {}, body: new Uint8Array(),
+    });
+    return request.send();
+  } });
+  try {
+    const pending = wrapped.send('eth_getLogs', []);
+    await clock.advance(30000);
+    assert.deepEqual(sent, [], 'the HTTP deadline must not bypass the shared cooldown');
+    await clock.advance(270000);
+    await pending;
+    assert.deepEqual(sent, [300000]);
   } finally { provider.destroy(); }
 });
